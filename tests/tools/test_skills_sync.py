@@ -846,9 +846,9 @@ class TestResetBundledSkill:
             assert "google-workspace" in post_manifest
         assert (skills_dir / "productivity" / "google-workspace" / "SKILL.md").exists()
 
-    def test_reset_restore_preserves_manifest_on_rmtree_failure(self, tmp_path):
-        """#34972: when rmtree fails (e.g. read-only Nix-store files), the manifest
-        entry must NOT be deleted — otherwise the skill enters a limbo state."""
+    def test_reset_restore_recovers_readonly_nix_store_copy(self, tmp_path):
+        """#34860/#34972: a read-only user copy (Nix-store permissions) must be
+        removable by the hardened rmtree so restore succeeds cleanly."""
         import os, stat
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"
@@ -857,19 +857,48 @@ class TestResetBundledSkill:
         dest = skills_dir / "productivity" / "google-workspace"
         dest.mkdir(parents=True)
         (dest / "SKILL.md").write_text("# user version\n")
-        # Make directory read-only to simulate Nix-store permissions
-        os.chmod(dest, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+        # Simulate Nix-store permissions: read-only file inside a read-only dir.
+        os.chmod(dest / "SKILL.md", stat.S_IREAD)
+        os.chmod(dest, stat.S_IREAD | stat.S_IEXEC)
         manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
 
         with self._patches(bundled, skills_dir, manifest_file):
             result = reset_bundled_skill("google-workspace", restore=True)
 
-        # Restore failed, but manifest must be preserved
+        # Hardened rmtree made the tree writable and removed it → restore succeeded.
+        assert result["ok"] is True
+        assert result["action"] == "restored"
+        # Skill was re-copied from the bundled source.
+        assert (skills_dir / "productivity" / "google-workspace" / "SKILL.md").exists()
+
+    def test_reset_restore_preserves_manifest_on_rmtree_failure(self, tmp_path):
+        """#34972: when rmtree genuinely cannot remove the copy (e.g. a dir we
+        don't own), the manifest entry must NOT be deleted — otherwise the skill
+        enters a limbo state. Manifest deletion must happen only AFTER a
+        successful rmtree."""
+        from unittest.mock import patch as _patch
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("# user version\n")
+        manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            # Force the removal to fail unconditionally, mimicking an
+            # unrecoverable permission error the chmod retry can't fix.
+            with _patch(
+                "tools.skills_sync._rmtree_writable",
+                side_effect=OSError("Operation not permitted"),
+            ):
+                result = reset_bundled_skill("google-workspace", restore=True)
+
+        # Restore failed, but manifest must be preserved.
         assert result["ok"] is False
         assert result["action"] == "not_reset"
         assert "Manifest entry preserved" in result["message"]
-        # Manifest still has the old entry (not deleted)
+        # Manifest still has the old entry (not deleted).
         manifest_after = manifest_file.read_text()
         assert "google-workspace" in manifest_after
-        # Cleanup: restore permissions for tmp_path removal
-        os.chmod(dest, stat.S_IRWXU)

@@ -567,15 +567,31 @@ def sync_skills(quiet: bool = False) -> dict:
 
 
 def _rmtree_writable(path: Path) -> None:
-    """Remove a directory tree, making read-only files writable first.
+    """Remove a directory tree, making read-only entries writable first.
 
     Handles immutable package sources (Nix store, deb/rpm installs) that
     preserve read-only permissions on copied files.  See #34860, #34972.
+
+    Deleting a read-only *directory* on POSIX requires owner write+execute on
+    the directory itself so rmtree can recurse and unlink its children — and
+    on the parent so the entry can be removed. ``stat.S_IWRITE`` alone is
+    insufficient (it clears the execute bit), so grant the full owner rwx and
+    also unlock the parent before retrying.
     """
+    import stat
+
     def _on_error(func, fpath, exc_info):
-        # Make the file/directory writable and retry
-        import stat
-        os.chmod(fpath, stat.S_IWRITE)
+        try:
+            parent = os.path.dirname(fpath)
+            if parent:
+                os.chmod(parent, stat.S_IRWXU | os.stat(parent).st_mode)
+        except OSError:
+            pass
+        try:
+            os.chmod(fpath, stat.S_IRWXU | os.stat(fpath).st_mode)
+        except OSError:
+            # Entry already gone or unstatable — let the retry surface it.
+            os.chmod(fpath, stat.S_IRWXU)
         func(fpath)
 
     shutil.rmtree(path, onerror=_on_error)
