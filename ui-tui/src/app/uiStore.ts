@@ -38,6 +38,16 @@ export const $uiSessionId = computed($uiState, state => state.sid)
 
 export const getUiState = () => $uiState.get()
 
+/**
+ * The status to fall back to once a transient/prompt-specific status
+ * ('waiting for input…', 'sudo password needed', 'secret input needed') no
+ * longer applies — e.g. when a dead clarify/sudo/secret overlay is dismissed
+ * via the null-RPC fallback, or when a prompt.expire clears the overlay. If
+ * the agent is mid-turn it's 'running…'; otherwise 'ready'. Single-sourced so
+ * the gateway-event handler and the useMainApp fallbacks can't drift.
+ */
+export const statusFromBusy = (): string => (getUiState().busy ? 'running…' : 'ready')
+
 export const patchUiState = (next: Partial<UiState> | ((state: UiState) => UiState)) =>
   $uiState.set(typeof next === 'function' ? next($uiState.get()) : { ...$uiState.get(), ...next })
 

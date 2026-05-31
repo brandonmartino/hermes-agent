@@ -19,11 +19,9 @@ import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { turnController } from './turnController.js'
-import { getUiState, patchUiState } from './uiStore.js'
+import { getUiState, patchUiState, statusFromBusy } from './uiStore.js'
 
 const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
-
-const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
 
 const applySkin = (s: GatewaySkin) =>
   patchUiState({
@@ -682,7 +680,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         setStatus('secret input needed')
 
         return
-
       case 'prompt.expire': {
         // Server-side _block timed out waiting for an answer.  The Python
         // agent thread has already resumed on an empty string; if we don't

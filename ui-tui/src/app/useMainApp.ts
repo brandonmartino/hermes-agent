@@ -37,7 +37,7 @@ import { $overlayState, getOverlayState, patchOverlayState } from './overlayStor
 import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
 import { patchTurnState, useTurnSelector } from './turnStore.js'
-import { $uiState, getUiState, patchUiState } from './uiStore.js'
+import { $uiState, getUiState, patchUiState, statusFromBusy } from './uiStore.js'
 import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
 import { useInputHandlers } from './useInputHandlers.js'
@@ -591,6 +591,10 @@ export function useMainApp(gw: GatewayClient) {
           // leave a zombie overlay anchored over the composer.
           if (getOverlayState().clarify?.requestId === clarify.requestId) {
             patchOverlayState({ clarify: null })
+            // The clarify.request set status to 'waiting for input…'; with the
+            // overlay now dismissed nothing else resets it, so the bar would
+            // keep claiming we're waiting. Snap back to the real busy/ready.
+            patchUiState({ status: statusFromBusy() })
           }
 
           return
@@ -886,6 +890,9 @@ export function useMainApp(gw: GatewayClient) {
         () => {
           if (getOverlayState().sudo?.requestId === requestId) {
             patchOverlayState({ sudo: null })
+            // Reset the 'sudo password needed' status the request set, same
+            // reasoning as the clarify fallback above.
+            patchUiState({ status: statusFromBusy() })
           }
         }
       )
@@ -912,6 +919,9 @@ export function useMainApp(gw: GatewayClient) {
         () => {
           if (getOverlayState().secret?.requestId === requestId) {
             patchOverlayState({ secret: null })
+            // Reset the 'secret input needed' status the request set, same
+            // reasoning as the clarify/sudo fallbacks above.
+            patchUiState({ status: statusFromBusy() })
           }
         }
       )
