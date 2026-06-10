@@ -89,6 +89,11 @@ export function Composer(props: {
   history?: PromptHistory | undefined
   onImagePaste?: (() => void) | undefined
   pasteStore?: PasteStore | undefined
+  /** Down on an EMPTY focused composer with no dropdown open (Epic 2.7 tray
+   *  handoff): return true to consume the key (the tray took focus). */
+  onFocusDown?: (() => boolean) | undefined
+  /** Hands the parent a "focus the textarea" callback (Esc from the tray). */
+  registerFocus?: ((focus: () => void) => void) | undefined
 }) {
   const theme = useTheme()
   const dims = useDimensions()
@@ -178,10 +183,32 @@ export function Composer(props: {
         return
       }
     }
-    // 2) prompt history (item 6): Up at the first line → older prompt; Down at the
+    // 2) background-agents tray handoff (Epic 2.7): Down on an EMPTY focused
+    // composer with NO dropdown open offers focus to the tray. The parent decides
+    // eligibility (≥1 running agent; overlays/prompts replace the composer
+    // entirely, so they can't get here) and returns true when it took focus —
+    // preventDefault keeps the consumed Down out of the textarea AND out of the
+    // tray's own selection handler (it skips defaultPrevented keys). Otherwise
+    // Down keeps every existing meaning (menu nav above, history below).
+    if (
+      key.name === 'down' &&
+      !key.ctrl &&
+      !key.meta &&
+      !key.option &&
+      menu.length === 0 &&
+      ta?.focused === true &&
+      ta.plainText === '' &&
+      props.onFocusDown?.() === true
+    ) {
+      key.preventDefault()
+      return
+    }
+    // 3) prompt history (item 6): Up at the first line → older prompt; Down at the
     // last line → newer/draft. At the boundary the textarea's own up/down is a
     // no-op, so there's no conflict; mid-buffer it falls through to cursor moves.
-    if (ta && props.history) {
+    // Gated on the textarea being FOCUSED: while focus is elsewhere (the agents
+    // tray, the transcript scrollbox) arrows must not recall history into the buffer.
+    if (ta?.focused && props.history) {
       if (key.name === 'up' && ta.logicalCursor.row === 0) {
         const entry = props.history.prev(ta.plainText)
         if (entry !== null) setBuffer(entry)
@@ -197,7 +224,7 @@ export function Composer(props: {
         props.history.reset()
       }
     }
-    // 3) always-active input (item 2): a printable key while the textarea lost
+    // 4) always-active input (item 2): a printable key while the textarea lost
     // focus reclaims it. The renderer runs this GLOBAL handler BEFORE routing the
     // key to the focused renderable, so after focus() the SAME keystroke is still
     // delivered to the (now-focused) textarea — do NOT insert it here too, or the
@@ -207,7 +234,10 @@ export function Composer(props: {
     }
   })
 
-  onMount(() => ta?.focus())
+  onMount(() => {
+    ta?.focus()
+    props.registerFocus?.(() => ta?.focus())
+  })
 
   return (
     <box style={{ flexDirection: 'column', flexShrink: 0 }}>

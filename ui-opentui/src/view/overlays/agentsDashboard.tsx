@@ -26,7 +26,12 @@ function statusColor(status: string, theme: ReturnType<typeof useTheme>): string
   return c.warn
 }
 
-export function AgentsDashboard(props: { subagents: SubagentInfo[]; onClose: () => void }) {
+export function AgentsDashboard(props: {
+  subagents: SubagentInfo[]
+  onClose: () => void
+  /** Subagent id to preselect on open (Enter from the agents tray — Epic 2.7). */
+  preselect?: string | undefined
+}) {
   const theme = useTheme()
   const [sel, setSel] = createSignal(0)
   let rootRef: BoxRenderable | undefined
@@ -38,7 +43,14 @@ export function AgentsDashboard(props: { subagents: SubagentInfo[]; onClose: () 
 
   // Close (Esc/Ctrl+C) is the native keymap; select + scroll stay in the raw global
   // handler below. Focus the root box on mount so the focus-within close layer is active.
-  onMount(() => rootRef?.focus())
+  // A `preselect` id (tray Enter) lands the selection on that agent's row.
+  onMount(() => {
+    rootRef?.focus()
+    if (props.preselect) {
+      const idx = props.subagents.findIndex(sa => sa.id === props.preselect)
+      if (idx >= 0) setSel(idx)
+    }
+  })
   useCloseLayer(
     () => rootRef,
     () => props.onClose()

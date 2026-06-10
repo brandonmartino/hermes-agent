@@ -63,7 +63,14 @@ export default defineConfig({
         // runtime, so post-mount store updates would never repaint test frames
         // (@opentui/solid itself deep-imports `solid-js/dist/solid.js`, which is
         // exactly where the alias points — one shared runtime).
-        inline: [/solid-js[/\\]store/]
+        //
+        // Same story for @opentui/keymap: externalized, its bare `import "solid-js"`
+        // gets the SSR server build — a SECOND runtime whose `Owner` is null inside
+        // client-runtime computations, so `useKeymap()` threw "Keymap not found" for
+        // any overlay mounted AFTER the initial render (dashboard/pager opened by a
+        // store update). The production build is immune (esbuild bundles the keymap
+        // and force-resolves solid-js to the client build for every importer).
+        inline: [/solid-js[/\\]store/, /@opentui[/\\]keymap/]
       }
     }
   }

@@ -19,6 +19,7 @@ import { deferClose } from '../logic/defer.ts'
 import type { PromptHistory } from '../logic/history.ts'
 import type { PasteStore } from '../logic/pastes.ts'
 import type { SessionStore } from '../logic/store.ts'
+import { AgentsTray, type AgentsTrayApi } from './agentsTray.tsx'
 import { Composer } from './composer.tsx'
 import { DimensionsProvider } from './dimensions.tsx'
 import { Header } from './header.tsx'
@@ -52,6 +53,11 @@ const NO_SESSION = () => undefined
 
 export function App(props: AppProps) {
   const theme = useTheme()
+  // Background-agents tray focus plumbing (Epic 2.7): Down on an empty composer
+  // hands focus to the tray; Esc from the tray hands it back. Plain refs — the
+  // tray persists across composer remounts (overlay close re-registers focus).
+  let trayApi: AgentsTrayApi | undefined
+  let focusComposer: (() => void) | undefined
   const blocked = () => props.store.state.prompt !== undefined
   const pager = () => props.store.state.pager
   const dashboard = () => props.store.state.dashboard
@@ -105,6 +111,8 @@ export function App(props: AppProps) {
                         history={props.history}
                         onImagePaste={props.onImagePaste}
                         pasteStore={props.pasteStore}
+                        onFocusDown={() => trayApi?.focusTray() ?? false}
+                        registerFocus={fn => (focusComposer = fn)}
                       />
                     }
                   >
@@ -132,13 +140,26 @@ export function App(props: AppProps) {
                       )}
                     </Match>
                   </Switch>
+                  {/* background-agents tray (Epic 2.7): renders nothing with no
+                      running agents; a one-line indicator otherwise; expands while
+                      focused (composer Down). Enter opens the dashboard on that row. */}
+                  <AgentsTray
+                    subagents={props.store.state.subagents}
+                    onOpen={id => props.store.openDashboard(id)}
+                    onExit={() => focusComposer?.()}
+                    bind={api => (trayApi = api)}
+                  />
                 </box>
               </>
             }
           >
             <Match when={pager()}>{p => <Pager title={p().title} text={p().text} onClose={closePager} />}</Match>
             <Match when={dashboard()}>
-              <AgentsDashboard subagents={props.store.state.subagents} onClose={closeDashboard} />
+              <AgentsDashboard
+                subagents={props.store.state.subagents}
+                onClose={closeDashboard}
+                preselect={props.store.state.dashboardAgent}
+              />
             </Match>
           </Switch>
         </box>
