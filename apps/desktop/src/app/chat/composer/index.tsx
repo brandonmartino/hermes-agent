@@ -27,11 +27,13 @@ import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import {
   $composerAttachments,
+  $voiceConversationStartRequest,
   clearComposerAttachments,
   clearSessionDraft,
   type ComposerAttachment,
   stashSessionDraft,
-  takeSessionDraft
+  takeSessionDraft,
+  takeVoiceConversationStart
 } from '@/store/composer'
 import {
   browseBackward,
@@ -85,7 +87,6 @@ import {
   onComposerInsertRefsRequest,
   onComposerInsertRequest,
   onComposerSubmitRequest,
-  onComposerVoiceStartRequest,
   onComposerVoiceToggleRequest
 } from './focus'
 import { HelpHint } from './help-hint'
@@ -2023,15 +2024,21 @@ export function ChatBar({
 
   useEffect(() => onComposerVoiceToggleRequest(toggleVoiceConversation), [toggleVoiceConversation])
 
-  // "Hey Hermes" wake word: an explicit START (idempotent) so a freshly-opened
-  // session begins back-and-forth voice without toggling an active one off.
-  const startVoiceConversation = useCallback(() => {
-    if (!disabled && !voiceConversationActive) {
+  // "Hey Hermes" wake word: a latched start request (nanostore) the composer
+  // claims once it's mounted and the gateway is open. Survives the fresh-session
+  // remount the wake handler triggers, and waits out a transient `disabled`.
+  const voiceStartReq = useStore($voiceConversationStartRequest)
+  useEffect(() => {
+    if (disabled) {
+      return // not ready — re-runs when `disabled` flips false
+    }
+    if (!takeVoiceConversationStart(voiceStartReq)) {
+      return
+    }
+    if (!voiceConversationActive) {
       setVoiceConversationActive(true)
     }
-  }, [disabled, voiceConversationActive])
-
-  useEffect(() => onComposerVoiceStartRequest(startVoiceConversation), [startVoiceConversation])
+  }, [voiceStartReq, disabled, voiceConversationActive])
 
   // Hand the mic between the server-side wake detector and the browser's voice
   // loop: pause the detector while a conversation is live, resume it after
