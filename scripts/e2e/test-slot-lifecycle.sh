@@ -46,6 +46,12 @@ printf '==> building hermes-updater with ephemeral E2E trust key\n'
     fi
 )
 LAUNCHER="$LAUNCHER_DIR/target/debug/hermes"
+BOOTSTRAP="$WORK/hermes-updater"
+cp "$LAUNCHER" "$BOOTSTRAP"
+chmod +x "$BOOTSTRAP"
+managed() {
+    (cd "$WORK" && "$HERMES_HOME/bin/hermes" "$@")
+}
 PLATFORM=$(
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) echo linux-x64 ;;
@@ -127,11 +133,11 @@ make_bundle 1.0.0
 printf '1.0.0\n' > "$RELEASES/latest-stable.txt"
 
 printf '==> real install\n'
-"$LAUNCHER" install --source "file://$RELEASES" --channel stable
+"$BOOTSTRAP" install --source "file://$RELEASES" --channel stable
 [ "$(cat "$HERMES_HOME/current.txt")" = "1.0.0" ]
 [ -x "$HERMES_HOME/bin/hermes" ]
 [ -x "$HERMES_HOME/bin/hermes-updater" ]
-[ "$("$HERMES_HOME/bin/hermes" launch version-probe)" = "1.0.0" ]
+[ "$(managed launch version-probe)" = "1.0.0" ]
 
 make_bundle 2.0.0
 printf '2.0.0\n' > "$RELEASES/latest-stable.txt"
@@ -155,13 +161,13 @@ wait "$OLD_PROCESS_PID"
 [ ! -e "$HERMES_HOME/versions/interrupted.staging" ]
 [ "$(cat "$HERMES_HOME/current.txt")" = "2.0.0" ]
 [ "$(cat "$HERMES_HOME/previous.txt")" = "1.0.0" ]
-[ "$("$HERMES_HOME/bin/hermes" launch version-probe)" = "2.0.0" ]
+[ "$(managed launch version-probe)" = "2.0.0" ]
 
 printf '==> real rollback\n'
 "$HERMES_HOME/bin/hermes-updater" rollback
 [ "$(cat "$HERMES_HOME/current.txt")" = "1.0.0" ]
 [ "$(cat "$HERMES_HOME/previous.txt")" = "2.0.0" ]
-[ "$("$HERMES_HOME/bin/hermes" launch version-probe)" = "1.0.0" ]
+[ "$(managed launch version-probe)" = "1.0.0" ]
 
 printf '==> tampered bundle fails before flip\n'
 make_bundle 3.0.0 true

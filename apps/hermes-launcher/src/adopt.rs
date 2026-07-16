@@ -46,7 +46,7 @@ pub fn adopt(
     if let Err(error) = apply::apply_feature_ledger(hermes_home, &version) {
         eprintln!("warning: feature ledger application failed: {error:#}");
     }
-    if let Err(error) = crate::services::restart_gateway(hermes_home) {
+    if let Err(error) = crate::services::restart_gateway(hermes_home, &version) {
         eprintln!("warning: gateway restart failed: {error:#}");
     }
 

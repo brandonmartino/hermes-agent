@@ -56,6 +56,16 @@ fn apply_cwd_guard() -> anyhow::Result<Vec<String>> {
     if cli::invoked_as_updater() {
         return Ok(argv);
     }
+    let has_dev = argv.iter().any(|arg| arg == "--dev");
+    let has_global = argv.iter().any(|arg| arg == "--global");
+    if has_dev && has_global {
+        eprintln!("hermes: --dev and --global are contradictory — pick one.");
+        std::process::exit(2);
+    }
+    if has_global {
+        argv.retain(|arg| arg != "--global");
+        return Ok(argv);
+    }
     let cwd = std::env::current_dir().context("cannot resolve current directory")?;
     let executable = std::env::current_exe().context("cannot resolve launcher executable")?;
     let launcher_tree = tree::resolve_tree_root(&executable)?;
@@ -147,7 +157,7 @@ fn apply(
     if let Err(error) = apply::apply_feature_ledger(&home, &manifest.version) {
         eprintln!("warning: feature ledger application failed: {error:#}");
     }
-    if let Err(error) = services::restart_gateway(&home) {
+    if let Err(error) = services::restart_gateway(&home, &manifest.version) {
         eprintln!("warning: gateway restart failed: {error:#}");
     }
     services::write_notify_files(
