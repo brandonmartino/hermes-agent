@@ -1,6 +1,7 @@
 mod cli;
 mod launch;
 mod release;
+mod selfupdate;
 mod slots;
 mod tree;
 
@@ -99,7 +100,7 @@ fn adopt(
 }
 
 fn self_restage() -> anyhow::Result<()> {
-    todo!("self-restage: replace staged binary from current slot (task 1.6)")
+    todo!("self-restage: wire to selfupdate::self_restage (task 1.6 impl done, wiring in task 1.4's apply flow)")
 }
 
 #[cfg(test)]
