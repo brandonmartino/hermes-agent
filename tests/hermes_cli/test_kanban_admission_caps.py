@@ -131,11 +131,13 @@ def _write_state_db(home: Path, rows, *, include_billing_columns: bool = True):
             ]
             values = [
                 sid,
-                "m",
+                row.get("model", "m"),
                 row.get("estimated", 0),
                 row.get("actual", 0),
                 row["seen"],
             ]
+            columns.extend(["billing_provider", "billing_base_url"])
+            values.extend([row.get("billing_provider", ""), row.get("billing_base_url", "")])
             if include_billing_columns:
                 columns.extend(["billing_mode", "cost_status"])
                 values.extend([row.get("billing_mode", ""), row.get("cost_status")])
@@ -224,6 +226,161 @@ def test_subscription_included_zero_cost_rows_allow_dispatch_under_hold(isolated
     assert [row[0] for row in res.spawned] == task_ids
     assert not res.skipped_unknown_cost_policy
     assert res.spend_telemetry["included_cost_rows"] == 1
+
+
+def test_native_chatgpt_codex_blank_zero_rows_allow_dispatch_under_hold_across_profiles(isolated_kanban_home):
+    home, kb = isolated_kanban_home
+    now = 1_700_000_000
+    profile_homes = [home, home / "profiles" / "coder", home / "profiles" / "reviewer"]
+    for idx, profile_home in enumerate(profile_homes):
+        profile_home.mkdir(parents=True, exist_ok=True)
+        _write_state_db(
+            profile_home,
+            [{
+                "seen": now,
+                "actual": 0,
+                "estimated": 0,
+                "billing_provider": "auto",
+                "billing_base_url": "https://chatgpt.com/backend-api/codex/",
+                "billing_mode": "",
+                "cost_status": "",
+                "model": ["gpt-5.5", "gpt-5.6-sol", "gpt-5.5"][idx],
+            }],
+        )
+    with kb.connect_closing() as conn:
+        task_ids = _make_ready_tasks(kb, conn, 1)
+        monkeypatch_time = pytest.MonkeyPatch()
+        monkeypatch_time.setattr(kb.time, "time", lambda: now)
+        try:
+            res = kb.dispatch_once(
+                conn,
+                spawn_fn=_fake_spawn,
+                dry_run=True,
+                spend_config=kb.SpendAdmissionConfig(
+                    cap_usd=1,
+                    timezone_name="UTC",
+                    unknown_cost_policy="hold",
+                ),
+            )
+        finally:
+            monkeypatch_time.undo()
+
+    assert [row[0] for row in res.spawned] == task_ids
+    assert not res.skipped_unknown_cost_policy
+    assert res.spend_telemetry["included_cost_rows"] == 3
+    assert res.spend_telemetry["explicit_included_cost_rows"] == 0
+    assert res.spend_telemetry["transport_inferred_included_rows"] == 3
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://evilchatgpt.com/backend-api/codex/",
+        "https://chatgpt.com.evil/backend-api/codex/",
+        "https://user@chatgpt.com/backend-api/codex/",
+        "http://chatgpt.com/backend-api/codex/",
+        "https://api.openai.com/v1",
+        "https://chatgpt.com/backend-api/codexish/",
+        "https://chatgpt.com/backend-api/codex/../metered/",
+    ],
+)
+def test_native_chatgpt_codex_transport_inference_rejects_spoofed_and_custom_urls(
+    isolated_kanban_home,
+    base_url,
+):
+    home, kb = isolated_kanban_home
+    now = 1_700_000_000
+    _write_state_db(
+        home,
+        [{
+            "seen": now,
+            "actual": 0,
+            "estimated": 0,
+            "billing_provider": "auto",
+            "billing_base_url": base_url,
+            "billing_mode": "",
+            "cost_status": "",
+            "model": "gpt-5.5",
+        }],
+    )
+
+    summary = kb.read_daily_spend_ledger(
+        kb.SpendAdmissionConfig(cap_usd=1, timezone_name="UTC", unknown_cost_policy="hold"),
+        now=now,
+        profile_homes=[home],
+    )
+
+    assert summary.unknown_cost_rows == 1
+    assert summary.included_cost_rows == 0
+    assert summary.transport_inferred_included_rows == 0
+
+
+def test_provider_or_model_alone_do_not_mark_blank_zero_rows_included(isolated_kanban_home):
+    home, kb = isolated_kanban_home
+    now = 1_700_000_000
+    _write_state_db(
+        home,
+        [
+            {
+                "seen": now,
+                "actual": 0,
+                "estimated": 0,
+                "billing_provider": "auto",
+                "billing_base_url": "",
+                "billing_mode": "",
+                "cost_status": "",
+                "model": "gpt-5.5",
+            },
+            {
+                "seen": now,
+                "actual": 0,
+                "estimated": 0,
+                "billing_provider": "chatgpt",
+                "billing_base_url": "",
+                "billing_mode": "",
+                "cost_status": "",
+                "model": "other-model",
+            },
+        ],
+    )
+
+    summary = kb.read_daily_spend_ledger(
+        kb.SpendAdmissionConfig(cap_usd=1, timezone_name="UTC", unknown_cost_policy="hold"),
+        now=now,
+        profile_homes=[home],
+    )
+
+    assert summary.unknown_cost_rows == 2
+    assert summary.included_cost_rows == 0
+
+
+def test_native_chatgpt_codex_blank_positive_cost_still_counts_as_metered(isolated_kanban_home):
+    home, kb = isolated_kanban_home
+    now = 1_700_000_000
+    _write_state_db(
+        home,
+        [{
+            "seen": now,
+            "actual": 1.25,
+            "estimated": 0,
+            "billing_provider": "auto",
+            "billing_base_url": "https://chatgpt.com/backend-api/codex/",
+            "billing_mode": "",
+            "cost_status": "",
+            "model": "gpt-5.5",
+        }],
+    )
+
+    summary = kb.read_daily_spend_ledger(
+        kb.SpendAdmissionConfig(cap_usd=10, timezone_name="UTC"),
+        now=now,
+        profile_homes=[home],
+    )
+
+    assert summary.known_cost_rows == 1
+    assert summary.known_metered_cost_usd == pytest.approx(1.25)
+    assert summary.included_cost_rows == 0
+    assert summary.transport_inferred_included_rows == 0
 
 
 def test_subscription_included_rows_do_not_increase_known_metered_spend(isolated_kanban_home):

@@ -74,6 +74,7 @@ import contextlib
 import hashlib
 import json
 import os
+import posixpath
 import re
 import random
 import secrets
@@ -89,6 +90,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -6115,6 +6117,8 @@ class SpendLedgerSummary:
     unknown_cost_rows: int = 0
     known_cost_rows: int = 0
     included_cost_rows: int = 0
+    explicit_included_cost_rows: int = 0
+    transport_inferred_included_rows: int = 0
     profiles_read: int = 0
     ledgers_read: int = 0
     ledgers_unavailable: int = 0
@@ -6132,6 +6136,8 @@ class SpendLedgerSummary:
             "unknown_cost_rows": self.unknown_cost_rows,
             "known_cost_rows": self.known_cost_rows,
             "included_cost_rows": self.included_cost_rows,
+            "explicit_included_cost_rows": self.explicit_included_cost_rows,
+            "transport_inferred_included_rows": self.transport_inferred_included_rows,
             "profiles_read": self.profiles_read,
             "ledgers_read": self.ledgers_read,
             "ledgers_unavailable": self.ledgers_unavailable,
@@ -7539,6 +7545,35 @@ def _day_bounds_for_timezone(tz_name: str, *, now: Optional[float] = None) -> tu
     return start.timestamp(), end.timestamp(), canonical_name
 
 
+def _is_native_chatgpt_codex_subscription_transport(base_url: Any) -> bool:
+    """Return True only for Hermes' native ChatGPT Codex subscription endpoint.
+
+    This intentionally trusts endpoint shape only, not provider labels or model
+    names. It also rejects userinfo, non-HTTPS schemes, and hostname suffix or
+    substring tricks so arbitrary OpenAI-compatible/custom metered endpoints stay
+    fail-closed under ``unknown_cost_policy: hold``.
+    """
+    raw = str(base_url or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != "https":
+        return False
+    if parsed.username or parsed.password:
+        return False
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if hostname != "chatgpt.com":
+        return False
+    decoded_path = unquote(parsed.path or "/")
+    normalized_path = posixpath.normpath("/" + decoded_path.lstrip("/"))
+    return normalized_path == "/backend-api/codex" or normalized_path.startswith(
+        "/backend-api/codex/"
+    )
+
+
 def _installed_profile_homes_for_spend() -> list[Path]:
     from hermes_constants import get_default_hermes_root
 
@@ -7576,14 +7611,17 @@ def read_daily_spend_ledger(
 ) -> SpendLedgerSummary:
     """Aggregate known metered spend from installed profiles' state.db files.
 
-    Read-only by construction. Actual dollars win over estimated dollars for a
-    row; rows with neither stay visible as unknown-cost telemetry and do not
-    contribute to the spend cap.
+    Read-only by construction. Explicit subscription-included telemetry always
+    wins first and does not contribute to the spend cap. Otherwise actual
+    dollars win over estimated dollars. Zero-cost blank rows are unknown unless
+    their endpoint is the strict native ChatGPT Codex subscription transport, in
+    which case they are counted separately as transport-inferred included rows.
     """
     start_ts, end_ts, tz_name = _day_bounds_for_timezone(config.timezone_name, now=now)
     homes = profile_homes if profile_homes is not None else _installed_profile_homes_for_spend()
     known = actual = estimated = 0.0
     unknown_rows = known_rows = included_rows = ledgers_read = unavailable = 0
+    explicit_included_rows = transport_inferred_included_rows = 0
     errors: list[str] = []
     for home in homes:
         db_path = Path(home) / "state.db"
@@ -7639,6 +7677,12 @@ def read_daily_spend_ledger(
             cost_status_expr = (
                 "u.cost_status" if "cost_status" in usage_columns else "NULL"
             )
+            billing_provider_expr = (
+                "u.billing_provider" if "billing_provider" in usage_columns else "NULL"
+            )
+            billing_base_url_expr = (
+                "u.billing_base_url" if "billing_base_url" in usage_columns else "NULL"
+            )
             join_clause = "LEFT JOIN sessions s ON s.id = u.session_id" if has_sessions else ""
             source_filter = ""
             if has_sessions and "source" in session_columns:
@@ -7649,6 +7693,8 @@ def read_daily_spend_ledger(
                           {estimated_expr} AS estimated_cost_usd,
                           {billing_mode_expr} AS billing_mode,
                           {cost_status_expr} AS cost_status,
+                          {billing_provider_expr} AS billing_provider,
+                          {billing_base_url_expr} AS billing_base_url,
                           {seen_expr} AS seen_at
                    FROM session_model_usage u
                    {join_clause}
@@ -7660,7 +7706,13 @@ def read_daily_spend_ledger(
             for row in rows:
                 billing_mode = str(row["billing_mode"] or "").strip().lower()
                 cost_status = str(row["cost_status"] or "").strip().lower()
+                # Classification precedence is load-bearing for fail-closed
+                # admission: explicit included rows are ignored even if legacy
+                # code wrote dollars; positive metered costs always count;
+                # only then can a zero-cost blank row be inferred as included
+                # from the native ChatGPT Codex subscription endpoint.
                 if billing_mode == "subscription_included" or cost_status == "included":
+                    explicit_included_rows += 1
                     included_rows += 1
                     continue
                 try:
@@ -7677,6 +7729,15 @@ def read_daily_spend_ledger(
                     estimated += est
                     known += est
                     known_rows += 1
+                elif (
+                    not billing_mode
+                    and not cost_status
+                    and _is_native_chatgpt_codex_subscription_transport(
+                        row["billing_base_url"]
+                    )
+                ):
+                    transport_inferred_included_rows += 1
+                    included_rows += 1
                 else:
                     unknown_rows += 1
         except sqlite3.DatabaseError as exc:
@@ -7693,6 +7754,8 @@ def read_daily_spend_ledger(
         unknown_cost_rows=unknown_rows,
         known_cost_rows=known_rows,
         included_cost_rows=included_rows,
+        explicit_included_cost_rows=explicit_included_rows,
+        transport_inferred_included_rows=transport_inferred_included_rows,
         profiles_read=len(homes),
         ledgers_read=ledgers_read,
         ledgers_unavailable=unavailable,
