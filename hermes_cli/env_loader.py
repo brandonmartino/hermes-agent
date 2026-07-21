@@ -47,6 +47,15 @@ _SECRET_SOURCES: dict[str, str] = {}
 _APPLIED_HOMES: set[str] = set()
 
 
+_DOTENV_DISABLED_VALUES = {"1", "true", "t", "yes", "y"}
+
+
+def dotenv_loading_disabled() -> bool:
+    """Match python-dotenv's PYTHON_DOTENV_DISABLED truthiness contract."""
+    value = os.environ.get("PYTHON_DOTENV_DISABLED")
+    return value is not None and value.casefold() in _DOTENV_DISABLED_VALUES
+
+
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
 
@@ -298,6 +307,9 @@ def load_hermes_dotenv(
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
+    if dotenv_loading_disabled():
+        return []
+
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))

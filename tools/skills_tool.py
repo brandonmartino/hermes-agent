@@ -79,6 +79,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
+from hermes_cli.env_loader import dotenv_loading_disabled
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
@@ -205,6 +206,8 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
 
 def load_env() -> Dict[str, str]:
     """Load profile-scoped environment variables from HERMES_HOME/.env."""
+    if dotenv_loading_disabled():
+        return {}
     env_path = get_hermes_home() / ".env"
     env_vars: Dict[str, str] = {}
     if not env_path.exists():
