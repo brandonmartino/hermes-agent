@@ -72,19 +72,19 @@ export interface BillingPlanCardView {
   caption: string
   /** Portal escape hatch for teams / non-changers ("Adjust plan ↗"). */
   link?: { label: string; url: string }
+  /** A scheduled downgrade / cancellation waiting at period end (drives the undo). */
+  pending?: { tierName: string; when: string }
   price?: string
   tierName: string
 }
 
-export type BillingPlanTierState = 'current' | 'downgrade' | 'upgrade'
+export type BillingPlanTierState = 'current' | 'downgrade' | 'scheduled' | 'upgrade'
 
 /** One card in the `bview=plans` grid, derived from a live `tiers[]` entry. */
 export interface BillingPlanTierView {
-  /** Primary action for upgrades / no-current — opens the portal with `plan=`. */
+  /** Portal deep link for upgrades (opens the portal with `plan=`). Downgrades act in-app. */
   action?: { label: string; url: string }
   creditsDisplay?: string
-  /** Disabled-action caption; set for downgrades (ticket 11 moves these in-app). */
-  disabledCaption?: string
   name: string
   priceDisplay: string
   state: BillingPlanTierState
@@ -325,21 +325,25 @@ function derivePlanCard(
   const price = currentTier?.dollars_per_month_display
   const renewal = formatBillingDate(current?.cycle_ends_at ?? billing.usage?.renews_at)
   const unavailable = subscriptionResult ? !subscriptionResult.ok : false
+  const pending = pendingDowngrade(current)
 
   const caption = unavailable
     ? 'Subscription details are unavailable; opening the portal is still available.'
-    : current
-      ? `Renews ${renewal}`
-      : 'No active subscription — paid models draw down top-up credits.'
+    : pending
+      ? `Changes to ${pending.tierName} on ${pending.when}.`
+      : current
+        ? `Renews ${renewal}`
+        : 'No active subscription — paid models draw down top-up credits.'
 
   const isTeam = subscription?.context === 'team'
-  const hasActionableTier = tiers.some(tier => tier.state !== 'current')
+  const hasActionableTier = tiers.some(tier => tier.state === 'downgrade' || tier.state === 'upgrade')
   const canChange = Boolean(subscription?.can_change_plan) && !isTeam && !unavailable && hasActionableTier
 
   if (canChange) {
     return {
       action: { label: current ? 'Change plan' : 'View plans' },
       caption,
+      pending,
       price,
       tierName
     }
@@ -352,16 +356,34 @@ function derivePlanCard(
       label: 'Adjust plan ↗',
       url: buildManageSubscriptionUrl(subscription, subscription?.portal_url ?? billing.portal_url)
     },
+    pending,
     price,
     tierName
   }
 }
 
+// A scheduled downgrade waiting at period end, as a target + when it lands. NAS
+// carries only the tier NAME (no id) for the pending target, so the grid matches
+// the "Scheduled" marker by name.
+function pendingDowngrade(
+  current: null | undefined | NonNullable<SubscriptionStateResponse['current']>
+): { tierName: string; when: string } | undefined {
+  if (!current?.pending_downgrade_tier_name || !current.pending_downgrade_at) {
+    return undefined
+  }
+
+  return {
+    tierName: current.pending_downgrade_tier_name,
+    when: current.pending_downgrade_display ?? formatBillingDate(current.pending_downgrade_at)
+  }
+}
+
 /**
- * The plans-grid catalog. Each card's action depends on its order relative to the
+ * The plans-grid catalog. Each card's state depends on its order relative to the
  * current tier: current = inert marker; higher = "Choose ↗" opening the portal with
- * the tier pre-selected; lower = disabled with a caption noting downgrades are
- * moving in-app (ticket 11 wires the gateway pending-change flow). With no active
+ * the tier pre-selected; lower = an in-app "Downgrade" (chargeless, scheduled via the
+ * gateway). The already-scheduled downgrade target renders as an inert "Scheduled"
+ * marker; other lower tiers stay actionable (picking one reschedules). With no active
  * subscription the lowest-order ($0 / free) tier stands in as the current plan, so
  * there is no "subscribe to Free" upgrade and no downgrade state.
  *
@@ -398,6 +420,7 @@ function derivePlanTiers(
   const currentTier = explicitCurrent ?? (current == null ? gridTiers[0] : undefined)
   const currentOrder = currentTier?.tier_order
   const manageBase = subscription?.portal_url ?? fallbackPortalUrl
+  const pendingName = current?.pending_downgrade_at ? current.pending_downgrade_tier_name : null
 
   return gridTiers.map(tier => {
     const shared = {
@@ -411,13 +434,16 @@ function derivePlanTiers(
       return { ...shared, state: 'current' as const }
     }
 
-    // Downgrade = strictly below the current tier's order.
+    // A scheduled downgrade target is inert (matched by name — NAS sends no id for
+    // the pending target). Checked before the downgrade branch since the target IS
+    // a lower tier.
+    if (pendingName && tier.name === pendingName) {
+      return { ...shared, state: 'scheduled' as const }
+    }
+
+    // Downgrade = strictly below the current tier's order → in-app chargeless change.
     if (currentOrder != null && tier.tier_order < currentOrder) {
-      return {
-        ...shared,
-        disabledCaption: 'Downgrades are moving in-app — coming soon.',
-        state: 'downgrade' as const
-      }
+      return { ...shared, state: 'downgrade' as const }
     }
 
     return {
