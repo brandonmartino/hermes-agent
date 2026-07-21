@@ -226,7 +226,26 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  max_spawn: null                  # optional global running-worker cap
+  max_in_progress: null            # optional global running-task cap
+  max_in_progress_per_profile: null # optional per-profile running cap
+  max_task_starts_per_hour: null   # optional rolling task-run start cap
+  daily_spend_cap_usd: null        # optional daily known-metered spend cap
+  daily_spend_timezone: UTC        # IANA timezone for the local day boundary
+  unknown_cost_policy: allow       # allow | hold; unknown rows are telemetry
 ```
+
+Admission caps are native dispatcher brakes, not task failures. When a cap is
+hit, `ready` / `review` tasks stay in place for the next tick; the dispatcher
+does not increment failure counters, block tasks, kill active workers, or start a
+second scheduler. The rolling-start cap is checked under the board dispatch lock
+against `task_runs.started_at` rows from the trailing hour. The daily spend cap
+uses read-only connections to each installed profile's `state.db` and sums only
+known metered cost from `session_model_usage`: `actual_cost_usd` wins when
+present, otherwise `estimated_cost_usd` is used. Rows with no known cost are
+reported in sanitized telemetry and do not count toward the cap unless you set
+`unknown_cost_policy: hold`. If a positive spend cap is configured but no local
+ledger can be read at all, spawning fails closed for that tick.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway

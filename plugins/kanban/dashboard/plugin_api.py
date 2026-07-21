@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.config import load_config
 
 log = logging.getLogger(__name__)
 
@@ -1959,8 +1960,17 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        cfg = load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            board=board,
+            max_task_starts_per_hour=kanban_db._positive_optional_int(
+                kanban_cfg.get("max_task_starts_per_hour")
+            ),
+            spend_config=kanban_db.spend_admission_config_from_kanban_config(kanban_cfg),
         )
         # DispatchResult is a dataclass.
         try:

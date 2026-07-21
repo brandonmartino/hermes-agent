@@ -827,7 +827,7 @@ class GatewayKanbanWatchersMixin:
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
+        max_spawn = _kb._positive_optional_int(kanban_cfg.get("max_spawn", None))
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
@@ -929,6 +929,23 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        max_task_starts_per_hour = _kb._positive_optional_int(
+            kanban_cfg.get("max_task_starts_per_hour")
+        )
+        if max_task_starts_per_hour is not None:
+            logger.info(
+                "kanban dispatcher: max_task_starts_per_hour=%d",
+                max_task_starts_per_hour,
+            )
+        spend_config = _kb.spend_admission_config_from_kanban_config(kanban_cfg)
+        if spend_config.cap_usd is not None:
+            logger.info(
+                "kanban dispatcher: daily_spend_cap_usd=%.4f timezone=%s unknown_cost_policy=%s",
+                spend_config.cap_usd,
+                spend_config.timezone_name,
+                spend_config.unknown_cost_policy,
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1022,6 +1039,8 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    max_task_starts_per_hour=max_task_starts_per_hour,
+                    spend_config=spend_config,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

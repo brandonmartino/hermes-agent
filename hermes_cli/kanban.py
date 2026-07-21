@@ -2287,6 +2287,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        max_task_starts_per_hour = _coerce_positive_int(
+            _kanban_cfg.get("max_task_starts_per_hour")
+        )
+        spend_config = kb.spend_admission_config_from_kanban_config(_kanban_cfg)
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2297,6 +2301,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        max_task_starts_per_hour = None
+        spend_config = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2307,6 +2313,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_task_starts_per_hour=max_task_starts_per_hour,
+            spend_config=spend_config,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2327,6 +2335,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_rolling_start_capped": [
+                {"task_id": tid, "starts": starts, "cap": cap}
+                for (tid, starts, cap) in res.skipped_rolling_start_capped
+            ],
+            "skipped_daily_spend_capped": [
+                {"task_id": tid, "known_metered_cost_usd": cost, "cap_usd": cap}
+                for (tid, cost, cap) in res.skipped_daily_spend_capped
+            ],
+            "skipped_spend_ledger_unavailable": res.skipped_spend_ledger_unavailable,
+            "skipped_unknown_cost_policy": [
+                {"task_id": tid, "unknown_cost_rows": rows}
+                for (tid, rows) in res.skipped_unknown_cost_policy
+            ],
+            "spend_telemetry": res.spend_telemetry,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2364,6 +2386,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.skipped_rolling_start_capped:
+        print(f"Deferred (rolling start cap): {len(res.skipped_rolling_start_capped)}")
+    if res.skipped_daily_spend_capped:
+        print(f"Deferred (daily spend cap): {len(res.skipped_daily_spend_capped)}")
+    if res.skipped_spend_ledger_unavailable:
+        print(f"Deferred (spend ledger unavailable): {len(res.skipped_spend_ledger_unavailable)}")
+    if res.skipped_unknown_cost_policy:
+        print(f"Deferred (unknown-cost policy): {len(res.skipped_unknown_cost_policy)}")
     return 0
 
 

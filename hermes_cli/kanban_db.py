@@ -86,8 +86,10 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -6079,6 +6081,63 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_rolling_start_capped: list[tuple[str, int, int]] = field(default_factory=list)
+    """Ready/review task ids deferred by ``kanban.max_task_starts_per_hour``.
+    Entries are ``(task_id, starts_in_window, cap)``. Tasks stay ready/review
+    and failure counters are not touched."""
+    skipped_daily_spend_capped: list[tuple[str, float, float]] = field(default_factory=list)
+    """Ready/review task ids deferred by ``kanban.daily_spend_cap_usd``.
+    Entries are ``(task_id, known_metered_spend_usd, cap_usd)``."""
+    skipped_spend_ledger_unavailable: list[str] = field(default_factory=list)
+    """Ready/review task ids held fail-closed because a positive daily spend
+    cap was configured but no canonical local usage ledger could be read."""
+    skipped_unknown_cost_policy: list[tuple[str, int]] = field(default_factory=list)
+    """Ready/review task ids held by ``kanban.unknown_cost_policy: hold``
+    because today's ledger contains unmetered/unknown-cost rows."""
+    spend_telemetry: dict[str, Any] = field(default_factory=dict)
+    """Sanitized spend-admission telemetry. Contains aggregate dollars/counts
+    only; never prompt, message, or session content."""
+
+
+@dataclass(frozen=True)
+class SpendAdmissionConfig:
+    cap_usd: Optional[float] = None
+    timezone_name: str = "UTC"
+    unknown_cost_policy: str = "allow"
+
+
+@dataclass(frozen=True)
+class SpendLedgerSummary:
+    ledger_readable: bool
+    known_metered_cost_usd: float = 0.0
+    actual_cost_usd: float = 0.0
+    estimated_cost_usd: float = 0.0
+    unknown_cost_rows: int = 0
+    known_cost_rows: int = 0
+    profiles_read: int = 0
+    ledgers_read: int = 0
+    ledgers_unavailable: int = 0
+    day_start_ts: float = 0.0
+    day_end_ts: float = 0.0
+    timezone_name: str = "UTC"
+    errors: tuple[str, ...] = ()
+
+    def telemetry(self) -> dict[str, Any]:
+        return {
+            "ledger_readable": self.ledger_readable,
+            "known_metered_cost_usd": round(self.known_metered_cost_usd, 8),
+            "actual_cost_usd": round(self.actual_cost_usd, 8),
+            "estimated_cost_usd": round(self.estimated_cost_usd, 8),
+            "unknown_cost_rows": self.unknown_cost_rows,
+            "known_cost_rows": self.known_cost_rows,
+            "profiles_read": self.profiles_read,
+            "ledgers_read": self.ledgers_read,
+            "ledgers_unavailable": self.ledgers_unavailable,
+            "day_start_ts": self.day_start_ts,
+            "day_end_ts": self.day_end_ts,
+            "timezone": self.timezone_name,
+            "errors": list(self.errors[:5]),
+        }
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7436,6 +7495,162 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _positive_optional_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _positive_optional_float(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def spend_admission_config_from_kanban_config(kanban_cfg: Optional[dict]) -> SpendAdmissionConfig:
+    cfg = kanban_cfg or {}
+    tz_name = str(cfg.get("daily_spend_timezone") or "UTC").strip() or "UTC"
+    policy = str(cfg.get("unknown_cost_policy") or "allow").strip().lower()
+    if policy not in {"allow", "hold"}:
+        policy = "allow"
+    return SpendAdmissionConfig(
+        cap_usd=_positive_optional_float(cfg.get("daily_spend_cap_usd")),
+        timezone_name=tz_name,
+        unknown_cost_policy=policy,
+    )
+
+
+def _day_bounds_for_timezone(tz_name: str, *, now: Optional[float] = None) -> tuple[float, float, str]:
+    try:
+        tz = ZoneInfo(tz_name)
+        canonical_name = tz_name
+    except (ZoneInfoNotFoundError, ValueError):
+        tz = timezone.utc
+        canonical_name = "UTC"
+    dt = datetime.fromtimestamp(time.time() if now is None else now, tz)
+    start = datetime.combine(dt.date(), datetime_time.min, tzinfo=tz)
+    end = datetime.combine(dt.date() + timedelta(days=1), datetime_time.min, tzinfo=tz)
+    return start.timestamp(), end.timestamp(), canonical_name
+
+
+def _installed_profile_homes_for_spend() -> list[Path]:
+    from hermes_constants import get_default_hermes_root
+
+    root = get_default_hermes_root()
+    homes = [root]
+    profiles_dir = root / "profiles"
+    try:
+        homes.extend(child for child in sorted(profiles_dir.iterdir()) if child.is_dir())
+    except OSError:
+        pass
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for home in homes:
+        try:
+            key = str(home.resolve())
+        except OSError:
+            key = str(home)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(home)
+    return unique
+
+
+def read_daily_spend_ledger(
+    config: SpendAdmissionConfig,
+    *,
+    now: Optional[float] = None,
+    profile_homes: Optional[list[Path]] = None,
+) -> SpendLedgerSummary:
+    """Aggregate known metered spend from installed profiles' state.db files.
+
+    Read-only by construction. Actual dollars win over estimated dollars for a
+    row; rows with neither stay visible as unknown-cost telemetry and do not
+    contribute to the spend cap.
+    """
+    start_ts, end_ts, tz_name = _day_bounds_for_timezone(config.timezone_name, now=now)
+    homes = profile_homes if profile_homes is not None else _installed_profile_homes_for_spend()
+    known = actual = estimated = 0.0
+    unknown_rows = known_rows = ledgers_read = unavailable = 0
+    errors: list[str] = []
+    for home in homes:
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+            continue
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_model_usage'"
+            ).fetchone():
+                unavailable += 1
+                errors.append(f"{db_path}:missing session_model_usage")
+                continue
+            ledgers_read += 1
+            rows = conn.execute(
+                """SELECT u.actual_cost_usd, u.estimated_cost_usd,
+                          COALESCE(u.last_seen, s.ended_at, s.started_at) AS seen_at
+                   FROM session_model_usage u
+                   LEFT JOIN sessions s ON s.id = u.session_id
+                   WHERE COALESCE(u.last_seen, s.ended_at, s.started_at) >= ?
+                     AND COALESCE(u.last_seen, s.ended_at, s.started_at) < ?
+                     AND COALESCE(s.source, '') NOT IN ('_health_probe')""",
+                (start_ts, end_ts),
+            ).fetchall()
+            for row in rows:
+                try:
+                    act = float(row["actual_cost_usd"] or 0.0)
+                    est = float(row["estimated_cost_usd"] or 0.0)
+                except (TypeError, ValueError):
+                    unknown_rows += 1
+                    continue
+                if act > 0:
+                    actual += act
+                    known += act
+                    known_rows += 1
+                elif est > 0:
+                    estimated += est
+                    known += est
+                    known_rows += 1
+                else:
+                    unknown_rows += 1
+        except sqlite3.DatabaseError as exc:
+            unavailable += 1
+            errors.append(f"{db_path}:{type(exc).__name__}")
+        finally:
+            if conn is not None:
+                conn.close()
+    return SpendLedgerSummary(
+        ledger_readable=ledgers_read > 0,
+        known_metered_cost_usd=known,
+        actual_cost_usd=actual,
+        estimated_cost_usd=estimated,
+        unknown_cost_rows=unknown_rows,
+        known_cost_rows=known_rows,
+        profiles_read=len(homes),
+        ledgers_read=ledgers_read,
+        ledgers_unavailable=unavailable,
+        day_start_ts=start_ts,
+        day_end_ts=end_ts,
+        timezone_name=tz_name,
+        errors=tuple(errors),
+    )
+
+
+def _task_start_count_last_hour(conn: sqlite3.Connection, *, now: Optional[int] = None) -> int:
+    cutoff = int(time.time() if now is None else now) - 3600
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM task_runs WHERE started_at >= ?",
+        (cutoff,),
+    ).fetchone()[0])
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7449,6 +7664,9 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_task_starts_per_hour: Optional[int] = None,
+    spend_config: Optional[SpendAdmissionConfig] = None,
+    spend_ledger_reader=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7483,6 +7701,9 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_task_starts_per_hour=max_task_starts_per_hour,
+            spend_config=spend_config,
+            spend_ledger_reader=spend_ledger_reader,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7499,6 +7720,9 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            max_task_starts_per_hour=max_task_starts_per_hour,
+            spend_config=spend_config,
+            spend_ledger_reader=spend_ledger_reader,
         )
 
 
@@ -7515,6 +7739,9 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    max_task_starts_per_hour: Optional[int] = None,
+    spend_config: Optional[SpendAdmissionConfig] = None,
+    spend_ledger_reader=None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7593,6 +7820,48 @@ def _dispatch_once_locked(
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    _review_probe_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'review' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    _pending_admission_ids = [r["id"] for r in ready_rows] + [r["id"] for r in _review_probe_rows]
+
+    _spend_cfg = spend_config or SpendAdmissionConfig()
+    if _spend_cfg.cap_usd is not None and _pending_admission_ids:
+        _ledger_reader = spend_ledger_reader or read_daily_spend_ledger
+        _spend_summary = _ledger_reader(_spend_cfg)
+        result.spend_telemetry = _spend_summary.telemetry()
+        result.spend_telemetry["cap_usd"] = _spend_cfg.cap_usd
+        result.spend_telemetry["unknown_cost_policy"] = _spend_cfg.unknown_cost_policy
+        if not _spend_summary.ledger_readable:
+            result.skipped_spend_ledger_unavailable.extend(_pending_admission_ids)
+            return result
+        if (
+            _spend_cfg.unknown_cost_policy == "hold"
+            and _spend_summary.unknown_cost_rows > 0
+        ):
+            result.skipped_unknown_cost_policy.extend(
+                (tid, _spend_summary.unknown_cost_rows) for tid in _pending_admission_ids
+            )
+            return result
+        if _spend_summary.known_metered_cost_usd >= _spend_cfg.cap_usd:
+            result.skipped_daily_spend_capped.extend(
+                (tid, _spend_summary.known_metered_cost_usd, _spend_cfg.cap_usd)
+                for tid in _pending_admission_ids
+            )
+            return result
+
+    _rolling_cap = _positive_optional_int(max_task_starts_per_hour)
+    _rolling_starts = (
+        _task_start_count_last_hour(conn) if _rolling_cap is not None else 0
+    )
+    if _rolling_cap is not None and _rolling_starts >= _rolling_cap and _pending_admission_ids:
+        result.skipped_rolling_start_capped.extend(
+            (tid, _rolling_starts, _rolling_cap) for tid in _pending_admission_ids
+        )
+        return result
+
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -7647,6 +7916,9 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if _rolling_cap is not None and _rolling_starts + spawned >= _rolling_cap:
+            result.skipped_rolling_start_capped.append((row["id"], _rolling_starts + spawned, _rolling_cap))
+            continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -7750,6 +8022,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -7830,14 +8103,13 @@ def _dispatch_once_locked(
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
-    review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    review_rows = _review_probe_rows
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if _rolling_cap is not None and _rolling_starts + spawned >= _rolling_cap:
+            result.skipped_rolling_start_capped.append((row["id"], _rolling_starts + spawned, _rolling_cap))
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -7850,6 +8122,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
