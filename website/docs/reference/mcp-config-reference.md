@@ -39,7 +39,42 @@ mcp_servers:
       exclude: []
       resources: true
       prompts: true
+
+mcp:
+  servers:
+    include: []        # optional per-profile MCP server allowlist
+    exclude: []        # optional per-profile MCP server denylist
 ```
+
+## Per-profile server cold loading
+
+Each Hermes profile has its own `config.yaml`. Use `mcp.servers.include` or
+`mcp.servers.exclude` in that profile's config to decide which entries under
+`mcp_servers` are allowed to cold-connect before the first model call.
+
+When both filters are empty or unset, Hermes preserves the previous behavior:
+every configured `mcp_servers` entry may connect. When `include` is set, only
+the named servers are considered; unknown names are ignored. When `include` is
+empty and `exclude` is set, every configured server except the named servers is
+considered. Skipped servers are filtered before transport startup, so they do
+not spawn stdio processes, open HTTP/SSE transports, or register tools.
+
+```yaml
+mcp_servers:
+  github:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/work"]
+
+mcp:
+  servers:
+    include: [github]
+```
+
+Tool-level `mcp_servers.<name>.tools.include/exclude` still applies after a
+server connects; `mcp.servers.*` controls whether the server connects at all.
 
 ## Server keys
 

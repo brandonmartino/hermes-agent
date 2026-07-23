@@ -15,8 +15,12 @@ def _has_configured_mcp_servers() -> bool:
     """Cheap config probe so non-MCP users avoid importing the MCP stack."""
     try:
         from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_server_filters import filter_mcp_servers_for_profile
 
-        mcp_servers = (read_raw_config() or {}).get("mcp_servers")
+        raw_config = read_raw_config() or {}
+        mcp_servers = filter_mcp_servers_for_profile(
+            raw_config.get("mcp_servers"), raw_config
+        )
         return isinstance(mcp_servers, dict) and len(mcp_servers) > 0
     except Exception:
         # Be conservative: if config probing fails, try discovery in the
