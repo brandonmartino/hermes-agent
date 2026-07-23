@@ -4438,8 +4438,10 @@ def _load_mcp_config() -> Dict[str, dict]:
 
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
+        from hermes_cli.mcp_server_filters import filter_mcp_servers_for_profile
+
         config = load_config()
-        servers = config.get("mcp_servers")
+        servers = filter_mcp_servers_for_profile(config.get("mcp_servers"), config)
         if not servers or not isinstance(servers, dict):
             return {}
         # Ensure .env vars are available for interpolation

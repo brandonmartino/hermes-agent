@@ -1422,6 +1422,15 @@ DEFAULT_CONFIG = {
         # When disabled, the watcher still detects the change and prints
         # guidance to apply it deliberately via /reload-mcp.
         "auto_reload_on_config_change": True,
+        # Optional cold-load server filter for this profile's config.yaml.
+        # Default empty lists preserve existing behavior: every configured
+        # mcp_servers entry may connect. Set include to an allowlist when a
+        # profile should only spawn a subset; otherwise set exclude to deny
+        # expensive or irrelevant servers. include takes precedence.
+        "servers": {
+            "include": [],
+            "exclude": [],
+        },
     },
 
     # Tool-output truncation thresholds. When terminal output or a
