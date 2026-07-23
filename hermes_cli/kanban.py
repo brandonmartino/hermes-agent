@@ -2308,9 +2308,22 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 return None
             return ival if ival >= 1 else None
 
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
-        )
+        raw_profile_caps = _kanban_cfg.get("max_in_progress_per_profile")
+        if isinstance(raw_profile_caps, str) and raw_profile_caps.lstrip().startswith("{"):
+            try:
+                raw_profile_caps = json.loads(raw_profile_caps)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(raw_profile_caps, dict):
+            max_in_progress_per_profile = {
+                str(profile).strip(): cap
+                for profile, raw_cap in raw_profile_caps.items()
+                if str(profile).strip()
+                and not isinstance(raw_cap, bool)
+                and (cap := _coerce_positive_int(raw_cap)) is not None
+            } or None
+        else:
+            max_in_progress_per_profile = _coerce_positive_int(raw_profile_caps)
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.

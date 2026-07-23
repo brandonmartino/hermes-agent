@@ -165,3 +165,137 @@ def test_dispatch_result_has_skipped_per_profile_capped_field():
     r = DispatchResult()
     assert hasattr(r, "skipped_per_profile_capped")
     assert r.skipped_per_profile_capped == []
+
+
+def test_half_full_global_cap_still_fills_remaining_slots(isolated_kanban_home_with_profiles):
+    """Regression: max_in_progress must not turn remaining slots into a new
+    live ceiling and strand a half-full board."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        running = [
+            kb.create_task(conn, title=f"running-{i}", assignee="alpha")
+            for i in range(3)
+        ]
+        with kb.write_txn(conn):
+            for i, task_id in enumerate(running):
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', claim_lock = ?, worker_pid = ? WHERE id = ?",
+                    (f"test:{i}", os.getpid(), task_id),
+                )
+        for i in range(4):
+            kb.create_task(conn, title=f"ready-{i}", assignee="beta")
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
+            max_spawn=6,
+            max_in_progress=6,
+            max_in_progress_per_profile=4,
+        )
+
+    assert len(res.spawned) == 3
+    assert all(item[1] == "beta" for item in res.spawned)
+
+
+def test_max_in_progress_without_max_spawn_counts_existing_workers(isolated_kanban_home_with_profiles):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        running_id = kb.create_task(conn, title="running", assignee="alpha")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', claim_lock = ?, worker_pid = ? WHERE id = ?",
+                ("test:running", os.getpid(), running_id),
+            )
+        for i in range(3):
+            kb.create_task(conn, title=f"ready-{i}", assignee="beta")
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=False,
+            max_spawn=None,
+            max_in_progress=3,
+            max_in_progress_per_profile=4,
+        )
+
+    assert len(res.spawned) == 2
+
+
+def test_profile_specific_cap_map_fills_four_coder_and_two_reviewer(
+    isolated_kanban_home_with_profiles,
+):
+    """A map-shaped cap lets one dispatch tick fill heterogeneous lanes."""
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(5):
+            kb.create_task(conn, title=f"coder-{i}", assignee="alpha", priority=20)
+        for i in range(3):
+            kb.create_task(conn, title=f"reviewer-{i}", assignee="beta", priority=10)
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_spawn=6,
+            max_in_progress=6,
+            max_in_progress_per_profile={"alpha": 4, "beta": 2},
+        )
+
+    assignees = [who for _, who, _ in res.spawned]
+    assert assignees.count("alpha") == 4
+    assert assignees.count("beta") == 2
+    assert any(
+        who == "alpha" and current == 4
+        for _, who, current in res.skipped_per_profile_capped
+    )
+
+
+def test_global_cap_applies_when_only_review_work_remains(
+    isolated_kanban_home_with_profiles,
+):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        running_id = kb.create_task(conn, title="running", assignee="alpha")
+        review_id = kb.create_task(conn, title="review", assignee="beta")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running', claim_lock = ?, worker_pid = ? WHERE id = ?",
+                ("test:running", os.getpid(), running_id),
+            )
+            conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress=1,
+        )
+
+    assert res.spawned == []
+
+
+def test_dry_run_consumes_global_slots(isolated_kanban_home_with_profiles):
+    kb = isolated_kanban_home_with_profiles
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        for i in range(4):
+            kb.create_task(conn, title=f"ready-{i}", assignee="alpha")
+
+    with kb.connect_closing() as conn:
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            max_in_progress=2,
+        )
+
+    assert len(res.spawned) == 2

@@ -71,6 +71,34 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     assert captured.get("max_in_progress_per_profile") == 2
 
 
+def test_cli_dispatch_decodes_json_profile_cap_map(isolated_kanban_home, monkeypatch):
+    """`hermes config set` persists object-like values as strings; decode them."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    fake_config = {
+        "kanban": {
+            "max_in_progress_per_profile": '{"coder":4,"reviewer":2,"*":4}'
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+    captured = {}
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+    )
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    kb_cli._cmd_dispatch(args)
+
+    assert captured.get("max_in_progress_per_profile") == {
+        "coder": 4,
+        "reviewer": 2,
+        "*": 4,
+    }
+
+
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):
     """--max on the CLI takes precedence over kanban.max_spawn in config.
     The CLI flag is the explicit operator signal; config is the default."""

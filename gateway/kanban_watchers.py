@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -900,14 +901,40 @@ class GatewayKanbanWatchersMixin:
                 default_assignee,
             )
 
-        # Read kanban.max_in_progress_per_profile — per-profile concurrency
-        # cap (#21582). When set, no single profile gets more than N
-        # workers running at once, even if the global max_in_progress
-        # would allow it. Prevents one profile's local model / API quota
-        # / browser pool from being overwhelmed by a fan-out.
+        # Read kanban.max_in_progress_per_profile — either one positive integer
+        # for every profile or a map such as {"coder": 4, "reviewer": 2,
+        # "*": 1}. The map form lets the native gateway match authoritative
+        # profile-specific server caps instead of flattening every lane to the
+        # highest ceiling.
         raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
+        if isinstance(raw_per_profile, str) and raw_per_profile.lstrip().startswith("{"):
+            try:
+                raw_per_profile = json.loads(raw_per_profile)
+            except (TypeError, ValueError):
+                pass
         max_in_progress_per_profile = None
-        if raw_per_profile is not None:
+        if isinstance(raw_per_profile, dict):
+            parsed_caps = {}
+            for raw_profile, raw_cap in raw_per_profile.items():
+                profile = str(raw_profile).strip()
+                try:
+                    cap = int(raw_cap)
+                except (TypeError, ValueError):
+                    continue
+                if profile and not isinstance(raw_cap, bool) and cap >= 1:
+                    parsed_caps[profile] = cap
+            if parsed_caps:
+                max_in_progress_per_profile = parsed_caps
+                logger.info(
+                    "kanban dispatcher: max_in_progress_per_profile=%r",
+                    parsed_caps,
+                )
+            else:
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
+                    raw_per_profile,
+                )
+        elif raw_per_profile is not None:
             try:
                 max_in_progress_per_profile = int(raw_per_profile)
             except (TypeError, ValueError):
