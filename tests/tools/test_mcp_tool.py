@@ -758,6 +758,63 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_mcp_application_errors_do_not_trip_transport_breaker(self):
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("bad SQL", is_error=True)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        mcp_mod._server_error_counts.pop("test_srv", None)
+        mcp_mod._server_breaker_opened_at.pop("test_srv", None)
+
+        try:
+            handler = _make_tool_handler("test_srv", "query", 120)
+            with self._patch_mcp_loop():
+                for _ in range(mcp_mod._CIRCUIT_BREAKER_THRESHOLD + 1):
+                    result = json.loads(handler({"sql": "select * from missing"}))
+                    assert result["error"] == "bad SQL"
+
+            assert mock_session.call_tool.call_count == mcp_mod._CIRCUIT_BREAKER_THRESHOLD + 1
+            assert mcp_mod._server_error_counts.get("test_srv", 0) == 0
+            assert "test_srv" not in mcp_mod._server_breaker_opened_at
+        finally:
+            _servers.pop("test_srv", None)
+            mcp_mod._server_error_counts.pop("test_srv", None)
+            mcp_mod._server_breaker_opened_at.pop("test_srv", None)
+
+    def test_transport_exceptions_still_trip_transport_breaker(self):
+        import tools.mcp_tool as mcp_mod
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=RuntimeError("connection lost"))
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        mcp_mod._server_error_counts.pop("test_srv", None)
+        mcp_mod._server_breaker_opened_at.pop("test_srv", None)
+
+        try:
+            handler = _make_tool_handler("test_srv", "broken_tool", 120)
+            with self._patch_mcp_loop():
+                for _ in range(mcp_mod._CIRCUIT_BREAKER_THRESHOLD):
+                    result = json.loads(handler({}))
+                    assert "connection lost" in result["error"]
+
+                result = json.loads(handler({}))
+
+            assert "unreachable" in result["error"]
+            assert mock_session.call_tool.call_count == mcp_mod._CIRCUIT_BREAKER_THRESHOLD
+            assert mcp_mod._server_error_counts["test_srv"] == mcp_mod._CIRCUIT_BREAKER_THRESHOLD
+            assert "test_srv" in mcp_mod._server_breaker_opened_at
+        finally:
+            _servers.pop("test_srv", None)
+            mcp_mod._server_error_counts.pop("test_srv", None)
+            mcp_mod._server_breaker_opened_at.pop("test_srv", None)
+
     def test_disconnected_server(self):
         from tools.mcp_tool import _make_tool_handler, _servers
 

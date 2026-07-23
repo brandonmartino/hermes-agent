@@ -3591,8 +3591,10 @@ def _reset_server_error(server_name: str) -> None:
     """Fully close the breaker for ``server_name``.
 
     Clears both the failure count and the breaker-open timestamp. Call
-    this on any unambiguous success signal (successful tool call,
-    successful reconnect, manual /mcp refresh).
+    this on any unambiguous transport success signal (completed RPC
+    round-trip, successful reconnect, manual /mcp refresh). A tool-level
+    ``isError`` payload is still a healthy RPC response and must not count
+    as transport failure.
     """
     _server_error_counts[server_name] = 0
     _server_breaker_opened_at.pop(server_name, None)
@@ -4713,15 +4715,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # _call_once returning means session.call_tool completed an MCP
+            # RPC round trip. That is transport health even when the tool's
+            # application payload is ``isError`` and serializes to
+            # ``{"error": ...}`` (for example, a bad SQL query). The circuit
+            # breaker guards broken transports, not valid tool/application
+            # errors, so any completed call closes it.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()
